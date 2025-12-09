@@ -1,11 +1,12 @@
 {
   "name": "YouTube Downloader API",
-  "description": "Simple YouTube Audio/Video Downloader API using Flask + yt-dlp.",
-  "repository": "https://github.com/GhostDraco/Youtube-Api",
+  "description": "A Flask-based YouTube downloader API that supports audio and video downloads",
+  "repository": "https://github.com/yourusername/youtube-downloader-api",
+  "keywords": ["python", "flask", "youtube", "downloader", "api"],
   "env": {
     "PYTHON_VERSION": {
-      "description": "Python runtime version",
-      "value": "3.10.13"
+      "description": "Python version",
+      "value": "3.10.0"
     }
   },
   "buildpacks": [
@@ -13,7 +14,10 @@
       "url": "heroku/python"
     }
   ],
-  "scripts": {
-    "postdeploy": "echo Deployment Complete"
+  "addons": [],
+  "formation": {
+    "web": {
+      "quantity": 1
+    }
   }
 }
