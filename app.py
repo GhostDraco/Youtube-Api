@@ -4,9 +4,10 @@ import subprocess
 import shutil
 import time
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import logging
+import mimetypes
 
 app = Flask(__name__)
 CORS(app)
@@ -32,7 +33,6 @@ def get_video_id(url):
     if len(url) == 11 and ' ' not in url and '/' not in url and '=' not in url:
         return url
     
-    # Extract from various YouTube URL formats
     patterns = [
         r'youtube\.com/watch\?v=([^&]+)',
         r'youtu\.be/([^?]+)',
@@ -46,74 +46,132 @@ def get_video_id(url):
         if match:
             return match.group(1)
     
-    # If URL contains v= parameter
     if 'v=' in url:
         return url.split('v=')[-1].split('&')[0]
     
     return url
 
-def check_cookies():
-    """Check if cookies.txt exists"""
-    if not os.path.exists(COOKIES_PATH):
-        logger.warning("cookies.txt not found - some videos may require login")
+def ensure_audio_compatibility(filepath):
+    """Ensure audio file is properly encoded for streaming"""
+    try:
+        # Check if file exists and has content
+        if not os.path.exists(filepath):
+            return False
+        
+        file_size = os.path.getsize(filepath)
+        if file_size < 10000:  # Less than 10KB
+            logger.warning(f"File too small: {filepath} ({file_size} bytes)")
+            return False
+        
+        # Use ffmpeg to check and fix audio if needed
+        temp_path = filepath + ".temp.mp3"
+        
+        # Re-encode audio to ensure compatibility
+        cmd = [
+            'ffmpeg',
+            '-i', filepath,
+            '-c:a', 'libmp3lame',
+            '-q:a', '2',  # High quality
+            '-ar', '44100',  # Standard sample rate
+            '-ac', '2',  # Stereo
+            '-id3v2_version', '3',
+            '-write_id3v1', '1',
+            '-y',  # Overwrite output
+            temp_path
+        ]
+        
+        logger.info(f"Ensuring audio compatibility: {filepath}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0 and os.path.exists(temp_path):
+            # Replace original with fixed version
+            os.remove(filepath)
+            shutil.move(temp_path, filepath)
+            logger.info(f"Audio file optimized: {filepath}")
+            return True
+        else:
+            logger.error(f"Audio optimization failed: {result.stderr[:200]}")
+            # Try simpler conversion
+            return simple_audio_fix(filepath)
+            
+    except Exception as e:
+        logger.error(f"Audio compatibility error: {str(e)}")
         return False
-    
-    file_size = os.path.getsize(COOKIES_PATH)
-    if file_size > 100:
-        logger.info(f"Using cookies.txt: {file_size} bytes")
-        return True
-    
-    return False
+
+def simple_audio_fix(filepath):
+    """Simple audio fix for compatibility"""
+    try:
+        temp_path = filepath + ".fixed.mp3"
+        
+        cmd = [
+            'ffmpeg',
+            '-i', filepath,
+            '-c:a', 'copy',  # Just copy without re-encoding if possible
+            '-y',
+            temp_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        
+        if result.returncode == 0 and os.path.exists(temp_path):
+            os.remove(filepath)
+            shutil.move(temp_path, filepath)
+            return True
+        
+        return False
+    except:
+        return False
 
 def download_media(video_id, media_type):
-    """Download audio or video"""
+    """Download audio or video with proper encoding"""
     
     output_file = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
     output_path = os.path.join(DOWNLOAD_DIR, output_file)
     
-    # Check if file already exists
+    # Check if file already exists and is valid
     if os.path.exists(output_path):
         file_size = os.path.getsize(output_path)
-        if file_size > 50000:
-            logger.info(f"Using cached file: {output_file}")
+        if file_size > 50000:  # At least 50KB
+            logger.info(f"Using cached: {output_file} ({file_size/1024:.1f} KB)")
+            
+            # For audio files, ensure compatibility
+            if media_type == 'audio':
+                ensure_audio_compatibility(output_path)
+            
             return True, output_path
+        else:
+            os.remove(output_path)  # Remove corrupted file
     
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
     
-    # Build command
+    # Build optimized yt-dlp command for streaming compatibility
     cmd = ['yt-dlp', '--quiet', '--no-warnings']
     
-    # Add cookies if available
     if os.path.exists(COOKIES_PATH):
         cmd.extend(['--cookies', COOKIES_PATH])
     
-    # Add common options
+    # Common options for better compatibility
     cmd.extend([
         '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        '--retries', '10',
-        '--fragment-retries', '10',
-        '--skip-unavailable-fragments',
+        '--retries', '5',
+        '--fragment-retries', '5',
         '--no-check-certificates',
         '--force-ipv4',
         '--geo-bypass',
     ])
     
-    # Add media type options
     if media_type == 'audio':
+        # Optimized audio download for streaming
         cmd.extend([
-            '-x',
+            '-x',  # Extract audio
             '--audio-format', 'mp3',
-            '--audio-quality', '0',
-            '--embed-thumbnail',
-            '--add-metadata',
+            '--audio-quality', '0',  # Best quality
+            '--postprocessor-args', '-ar 44100 -ac 2',  # Force standard format
             '--output', os.path.join(DOWNLOAD_DIR, f'{video_id}.%(ext)s'),
         ])
     else:  # video
         cmd.extend([
-            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            '--merge-output-format', 'mp4',
-            '--embed-thumbnail',
-            '--add-metadata',
+            '-f', 'best[ext=mp4]',  # Simple format for compatibility
             '--output', os.path.join(DOWNLOAD_DIR, f'{video_id}.%(ext)s'),
         ])
     
@@ -122,84 +180,67 @@ def download_media(video_id, media_type):
     try:
         logger.info(f"Downloading {media_type}: {video_id}")
         
-        # Run download
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         if result.returncode == 0:
+            # Check if file was created
             if os.path.exists(output_path):
+                # Post-process audio for streaming compatibility
+                if media_type == 'audio':
+                    ensure_audio_compatibility(output_path)
+                
                 return True, output_path
-            else:
-                # Find any file with this video ID
-                for filename in os.listdir(DOWNLOAD_DIR):
-                    if filename.startswith(video_id):
-                        found_path = os.path.join(DOWNLOAD_DIR, filename)
-                        if filename != output_file:
-                            shutil.move(found_path, output_path)
-                        return True, output_path
+            
+            # Try to find the file
+            for filename in os.listdir(DOWNLOAD_DIR):
+                if filename.startswith(video_id):
+                    found_path = os.path.join(DOWNLOAD_DIR, filename)
+                    if filename != output_file:
+                        shutil.move(found_path, output_path)
+                    
+                    # Post-process audio
+                    if media_type == 'audio':
+                        ensure_audio_compatibility(output_path)
+                    
+                    return True, output_path
         
         return False, result.stderr[:500] if result.stderr else "Download failed"
         
     except Exception as e:
         return False, str(e)
 
-# ============== LIGHTWEIGHT API ENDPOINTS ==============
-# Compatible with: https://shrutibots.site format
+# ============== API ENDPOINTS ==============
 
 @app.route('/download', methods=['GET'])
 def download():
-    """
-    Lightweight API endpoint (compatible with shrutibots.site)
-    
-    Parameters:
-        url: YouTube URL or Video ID
-        type: "audio" or "video"
-    
-    Returns:
-        Format 1: {"link": "stream_url"}  # for lightweight clients
-        Format 2: {"status": "success", "stream_url": "url"}  # for full clients
-    """
+    """Download endpoint"""
     try:
         video_url = request.args.get('url', '').strip()
         media_type = request.args.get('type', 'audio').strip().lower()
         
-        # Validate
         if not video_url:
             return jsonify({'error': 'Missing URL'}), 400
         
         if media_type not in ['audio', 'video']:
             return jsonify({'error': 'Invalid type'}), 400
         
-        # Get video ID
         video_id = get_video_id(video_url)
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
         
-        logger.info(f"Lightweight download request: {video_id} ({media_type})")
+        logger.info(f"Download request: {video_id} ({media_type})")
         
-        # Download file
         success, result = download_media(video_id, media_type)
         
         if success:
             stream_url = f"{request.host_url.rstrip('/')}/stream/{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
             
-            # Check client type from User-Agent or Accept header
-            user_agent = request.headers.get('User-Agent', '').lower()
-            accept_header = request.headers.get('Accept', '')
-            
-            # Determine response format
-            if 'python' in user_agent or 'requests' in user_agent or 'application/json' in accept_header:
-                # Full JSON response (for Python clients)
-                return jsonify({
-                    'status': 'success',
-                    'stream_url': stream_url,
-                    'video_id': video_id,
-                    'type': media_type
-                })
-            else:
-                # Lightweight response (compatible with shrutibots.site)
-                return jsonify({
-                    'link': stream_url
-                })
+            return jsonify({
+                'status': 'success',
+                'stream_url': stream_url,
+                'video_id': video_id,
+                'type': media_type
+            })
         else:
             return jsonify({'error': result}), 500
             
@@ -209,269 +250,264 @@ def download():
 
 @app.route('/stream/<filename>', methods=['GET'])
 def stream_file(filename):
-    """Stream/download file"""
+    """Stream file with proper headers for playback"""
     try:
+        # Security check
+        if '..' in filename or '/' in filename:
+            return jsonify({'error': 'Invalid filename'}), 400
+        
         filepath = os.path.join(DOWNLOAD_DIR, filename)
         
         if not os.path.exists(filepath):
             return jsonify({'error': 'File not found'}), 404
         
-        return send_file(
+        # Check file
+        file_size = os.path.getsize(filepath)
+        if file_size < 10000:
+            return jsonify({'error': 'File too small or corrupted'}), 500
+        
+        # Determine content type
+        if filename.endswith('.mp3'):
+            content_type = 'audio/mpeg'
+            # Ensure audio is playable
+            if not ensure_audio_compatibility(filepath):
+                logger.warning(f"Audio compatibility check failed for {filename}")
+        elif filename.endswith('.mp4'):
+            content_type = 'video/mp4'
+        else:
+            content_type = 'application/octet-stream'
+        
+        # Get file stats
+        stat = os.stat(filepath)
+        last_modified = datetime.fromtimestamp(stat.st_mtime)
+        
+        # Check for Range header (for streaming)
+        range_header = request.headers.get('Range', None)
+        
+        if range_header and filename.endswith('.mp3'):
+            # Handle byte range requests for audio streaming
+            return send_range_request(filepath, content_type, range_header, file_size)
+        
+        # Regular file serve
+        response = send_file(
             filepath,
+            mimetype=content_type,
             as_attachment=False,
-            mimetype='audio/mpeg' if filename.endswith('.mp3') else 'video/mp4'
+            last_modified=last_modified
         )
         
+        # Add headers for proper streaming
+        response.headers['Accept-Ranges'] = 'bytes'
+        response.headers['Content-Length'] = str(file_size)
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        
+        # For audio files, add additional headers
+        if filename.endswith('.mp3'):
+            response.headers['Content-Type'] = 'audio/mpeg'
+            response.headers['X-Content-Type-Options'] = 'nosniff'
+        
+        return response
+        
     except Exception as e:
+        logger.error(f"Stream error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# ============== FULL-FEATURED API ENDPOINTS ==============
-# Compatible with ShrutiMusic YouTube class
-
-@app.route('/api/v1/search', methods=['GET'])
-def search_videos():
-    """Search videos (compatible with YouTube.search())"""
+def send_range_request(filepath, content_type, range_header, file_size):
+    """Handle byte range requests for streaming"""
     try:
-        query = request.args.get('q', '').strip()
-        limit = int(request.args.get('limit', 5))
+        range_start, range_end = parse_range_header(range_header, file_size)
         
-        if not query:
-            return jsonify({'error': 'Missing query'}), 400
+        if range_start >= file_size or range_end > file_size:
+            return Response('Range Not Satisfiable', status=416)
         
-        # Use yt-dlp to search
-        cmd = [
-            'yt-dlp', 'ytsearch{}:{}'.format(limit, query),
-            '--get-id',
-            '--get-title',
-            '--get-duration',
-            '--get-thumbnail',
-            '--quiet',
-            '--no-warnings'
-        ]
+        length = range_end - range_start
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        with open(filepath, 'rb') as f:
+            f.seek(range_start)
+            data = f.read(length)
         
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            videos = []
-            
-            for i in range(0, len(lines), 4):
-                if i + 3 < len(lines):
-                    videos.append({
-                        'id': lines[i],
-                        'title': lines[i+1],
-                        'duration': lines[i+2],
-                        'thumbnail': lines[i+3]
-                    })
-            
-            return jsonify({
-                'status': 'success',
-                'query': query,
-                'results': videos
-            })
+        response = Response(
+            data,
+            status=206,
+            mimetype=content_type,
+            direct_passthrough=True
+        )
+        
+        response.headers['Content-Range'] = f'bytes {range_start}-{range_end-1}/{file_size}'
+        response.headers['Content-Length'] = str(length)
+        response.headers['Accept-Ranges'] = 'bytes'
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Range request error: {str(e)}")
+        return Response(str(e), status=500)
+
+def parse_range_header(range_header, file_size):
+    """Parse Range header"""
+    try:
+        range_type, range_spec = range_header.split('=')
+        if range_type.strip() != 'bytes':
+            return 0, file_size
+        
+        range_parts = range_spec.strip().split('-')
+        range_start = int(range_parts[0]) if range_parts[0] else 0
+        
+        if len(range_parts) > 1 and range_parts[1]:
+            range_end = int(range_parts[1]) + 1
         else:
-            return jsonify({'error': 'Search failed'}), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            range_end = file_size
+        
+        return range_start, min(range_end, file_size)
+    except:
+        return 0, file_size
 
-@app.route('/api/v1/details', methods=['GET'])
-def video_details():
-    """Get video details (compatible with YouTube.details())"""
+@app.route('/play/<video_id>', methods=['GET'])
+def play_audio(video_id):
+    """Direct play endpoint for audio"""
     try:
-        video_url = request.args.get('url', '').strip()
+        filename = f"{video_id}.mp3"
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
         
-        if not video_url:
-            return jsonify({'error': 'Missing URL'}), 400
+        if not os.path.exists(filepath):
+            # Try to download it first
+            success, result = download_media(video_id, 'audio')
+            if not success:
+                return jsonify({'error': 'Audio not available'}), 404
         
-        video_id = get_video_id(video_url)
-        if not video_id:
-            return jsonify({'error': 'Invalid URL'}), 400
+        # Ensure audio is playable
+        ensure_audio_compatibility(filepath)
         
-        # Get video info using yt-dlp
-        cmd = [
-            'yt-dlp',
-            f'https://www.youtube.com/watch?v={video_id}',
-            '--get-title',
-            '--get-duration',
-            '--get-thumbnail',
-            '--get-id',
-            '--dump-json',
-            '--quiet',
-            '--no-warnings'
-        ]
+        # Return HTML player
+        html = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Play Audio - {video_id}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; padding: 20px; }}
+                .player {{ max-width: 500px; margin: 0 auto; text-align: center; }}
+                audio {{ width: 100%; }}
+                .info {{ margin-top: 20px; color: #666; }}
+            </style>
+        </head>
+        <body>
+            <div class="player">
+                <h2>Audio Player</h2>
+                <audio controls autoplay>
+                    <source src="/stream/{filename}" type="audio/mpeg">
+                    Your browser does not support the audio element.
+                </audio>
+                <div class="info">
+                    <p>Video ID: {video_id}</p>
+                    <p><a href="/stream/{filename}" download>Download MP3</a></p>
+                </div>
+            </div>
+        </body>
+        </html>
+        '''
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        return html
         
-        if result.returncode == 0:
-            try:
-                info = json.loads(result.stdout)
-                return jsonify({
-                    'status': 'success',
-                    'details': {
-                        'title': info.get('title'),
-                        'duration': info.get('duration_string'),
-                        'thumbnail': info.get('thumbnail'),
-                        'id': info.get('id'),
-                        'description': info.get('description'),
-                        'uploader': info.get('uploader'),
-                        'view_count': info.get('view_count')
-                    }
-                })
-            except:
-                # Fallback to simple parsing
-                lines = result.stdout.strip().split('\n')
-                if len(lines) >= 4:
-                    return jsonify({
-                        'status': 'success',
-                        'details': {
-                            'title': lines[0],
-                            'duration': lines[1],
-                            'thumbnail': lines[2],
-                            'id': lines[3]
-                        }
-                    })
-        
-        return jsonify({'error': 'Failed to get details'}), 500
-            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/v1/playlist', methods=['GET'])
-def playlist_items():
-    """Get playlist items (compatible with YouTube.playlist())"""
-    try:
-        playlist_url = request.args.get('url', '').strip()
-        limit = int(request.args.get('limit', 20))
-        
-        if not playlist_url:
-            return jsonify({'error': 'Missing playlist URL'}), 400
-        
-        # Get playlist items
-        cmd = [
-            'yt-dlp',
-            '--flat-playlist',
-            '--get-id',
-            '--playlist-end', str(limit),
-            '--quiet',
-            '--no-warnings',
-            playlist_url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            video_ids = [vid for vid in result.stdout.strip().split('\n') if vid]
-            
-            return jsonify({
-                'status': 'success',
-                'playlist_url': playlist_url,
-                'videos': video_ids,
-                'count': len(video_ids)
-            })
-        else:
-            return jsonify({'error': 'Failed to get playlist'}), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/v1/formats', methods=['GET'])
-def available_formats():
-    """Get available formats (compatible with YouTube.formats())"""
-    try:
-        video_url = request.args.get('url', '').strip()
-        
-        if not video_url:
-            return jsonify({'error': 'Missing URL'}), 400
-        
-        video_id = get_video_id(video_url)
-        if not video_id:
-            return jsonify({'error': 'Invalid URL'}), 400
-        
-        # Get formats info
-        cmd = [
-            'yt-dlp',
-            f'https://www.youtube.com/watch?v={video_id}',
-            '--list-formats',
-            '--quiet',
-            '--no-warnings'
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            formats = []
-            lines = result.stdout.strip().split('\n')
-            
-            for line in lines:
-                if 'mp4' in line or 'webm' in line or 'audio only' in line:
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        formats.append({
-                            'format_id': parts[0],
-                            'extension': parts[1],
-                            'resolution': parts[2] if len(parts) > 2 else '',
-                            'note': parts[3] if len(parts) > 3 else ''
-                        })
-            
-            return jsonify({
-                'status': 'success',
-                'formats': formats,
-                'video_id': video_id
-            })
-        else:
-            return jsonify({'error': 'Failed to get formats'}), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ============== UTILITY ENDPOINTS ==============
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'service': 'YouTube Dual-Format API',
-        'formats_supported': ['lightweight', 'full-featured'],
-        'timestamp': datetime.now().isoformat()
+        'service': 'YouTube Audio/Video Streamer',
+        'timestamp': datetime.now().isoformat(),
+        'endpoints': {
+            'download': '/download?url=VIDEO_ID&type=audio|video',
+            'stream': '/stream/FILENAME',
+            'play': '/play/VIDEO_ID',
+            'health': '/health'
+        }
     })
 
-@app.route('/api/v1/cleanup', methods=['POST'])
-def api_cleanup():
-    """Clean old files"""
+@app.route('/test/audio/<video_id>', methods=['GET'])
+def test_audio(video_id):
+    """Test audio download and streaming"""
     try:
-        deleted = []
-        current_time = time.time()
+        # Download audio
+        success, result = download_media(video_id, 'audio')
         
-        for filename in os.listdir(DOWNLOAD_DIR):
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(filepath):
-                file_age = current_time - os.path.getmtime(filepath)
-                if file_age > 86400:  # 24 hours
-                    os.remove(filepath)
-                    deleted.append(filename)
-        
-        return jsonify({
-            'status': 'success',
-            'deleted': deleted,
-            'count': len(deleted)
-        })
-        
+        if success:
+            file_size = os.path.getsize(result)
+            
+            # Test audio file with ffprobe
+            cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', result]
+            probe_result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            audio_info = {}
+            if probe_result.returncode == 0:
+                try:
+                    info = json.loads(probe_result.stdout)
+                    if info.get('streams'):
+                        for stream in info['streams']:
+                            if stream.get('codec_type') == 'audio':
+                                audio_info = {
+                                    'codec': stream.get('codec_name'),
+                                    'sample_rate': stream.get('sample_rate'),
+                                    'channels': stream.get('channels'),
+                                    'duration': stream.get('duration')
+                                }
+                                break
+                except:
+                    pass
+            
+            return jsonify({
+                'status': 'success',
+                'video_id': video_id,
+                'file_path': result,
+                'file_size_kb': round(file_size / 1024, 2),
+                'stream_url': f"{request.host_url.rstrip('/')}/stream/{video_id}.mp3",
+                'play_url': f"{request.host_url.rstrip('/')}/play/{video_id}",
+                'audio_info': audio_info
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'video_id': video_id,
+                'error': result
+            }), 500
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ============== COMPATIBILITY ENDPOINTS ==============
-# For direct compatibility with existing code
+# Background cleanup
+def cleanup_old_files():
+    """Clean old files periodically"""
+    import threading
+    
+    def cleanup():
+        while True:
+            try:
+                current_time = time.time()
+                for filename in os.listdir(DOWNLOAD_DIR):
+                    filepath = os.path.join(DOWNLOAD_DIR, filename)
+                    if os.path.isfile(filepath):
+                        file_age = current_time - os.path.getmtime(filepath)
+                        if file_age > 86400:  # 24 hours
+                            os.remove(filepath)
+                            logger.info(f"Cleaned up old file: {filename}")
+                time.sleep(3600)  # Run every hour
+            except Exception as e:
+                logger.error(f"Cleanup error: {str(e)}")
+                time.sleep(300)
+    
+    thread = threading.Thread(target=cleanup, daemon=True)
+    thread.start()
+    logger.info("Cleanup thread started")
 
-@app.route('/api/download', methods=['GET'])
-def api_download():
-    """API endpoint with consistent response format"""
-    return download()  # Use same logic as /download
-
+# Initialize
 if __name__ == '__main__':
+    cleanup_old_files()
+    
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🚀 YouTube Dual-Format API starting on port {port}")
-    logger.info("📱 Lightweight format: /download?url=ID&type=audio|video")
-    logger.info("💻 Full-featured format: /api/v1/ endpoints")
+    logger.info(f"🎵 Audio Streaming API starting on port {port}")
+    logger.info(f"📁 Downloads: {DOWNLOAD_DIR}")
     app.run(host='0.0.0.0', port=port, debug=False)
