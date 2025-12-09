@@ -1,0 +1,19 @@
+{
+  "name": "YouTube Downloader API",
+  "description": "Simple YouTube Audio/Video Downloader API using Flask + yt-dlp.",
+  "repository": "https://github.com/GhostDraco/Youtube-Api",
+  "env": {
+    "PYTHON_VERSION": {
+      "description": "Python runtime version",
+      "value": "3.10.13"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "scripts": {
+    "postdeploy": "echo Deployment Complete"
+  }
+}
