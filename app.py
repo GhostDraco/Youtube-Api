@@ -1,28 +1,21 @@
 import os
 import json
 import subprocess
-import shutil
+import tempfile
 import time
-import ssl
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import logging
 
 app = Flask(__name__)
 CORS(app)
 
-# Disable SSL certificate verification (FIX for Heroku)
-os.environ['SSL_CERT_FILE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-os.environ['CURL_CA_BUNDLE'] = ''
-
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_DIR = os.path.join(BASE_DIR, 'downloads')
-COOKIES_PATH = os.path.join(BASE_DIR, 'cookies.txt')
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Disable SSL verification
+os.environ['PYTHONHTTPSVERIFY'] = '0'
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -56,211 +49,105 @@ def get_video_id(url):
     
     return url
 
-def download_media_fixed(video_id, media_type):
-    """Download with SSL fix"""
-    
-    output_file = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
-    output_path = os.path.join(DOWNLOAD_DIR, output_file)
-    
-    # Check if file already exists
-    if os.path.exists(output_path):
-        file_size = os.path.getsize(output_path)
-        if file_size > 50000:
-            logger.info(f"Using cached: {output_file}")
-            return True, output_path
-    
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # Method 1: Try with SSL bypass
-    success, result = try_download_with_ssl_bypass(video_id, media_type, youtube_url)
-    
-    if success:
-        return True, result
-    
-    # Method 2: Try without SSL check
-    logger.info("Method 1 failed, trying Method 2...")
-    success, result = try_download_no_ssl(video_id, media_type, youtube_url)
-    
-    if success:
-        return True, result
-    
-    # Method 3: Use alternative approach
-    logger.info("Method 2 failed, trying Method 3...")
-    success, result = try_download_alternative(video_id, media_type, youtube_url)
-    
-    return success, result
-
-def try_download_with_ssl_bypass(video_id, media_type, youtube_url):
-    """Method 1: With SSL bypass"""
-    output_file = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
-    output_path = os.path.join(DOWNLOAD_DIR, output_file)
-    
-    cmd = [
-        'yt-dlp',
-        '--no-check-certificates',  # IMPORTANT: Disable SSL check
-        '--force-ipv4',
-        '--geo-bypass',
-        '--retries', '5',
-        '--fragment-retries', '5',
-        '--skip-unavailable-fragments',
-        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        '--quiet',
-        '--no-warnings',
-    ]
-    
-    if os.path.exists(COOKIES_PATH):
-        cmd.extend(['--cookies', COOKIES_PATH])
-    
-    if media_type == 'audio':
-        cmd.extend([
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '0',
-            '--output', os.path.join(DOWNLOAD_DIR, f'{video_id}.%(ext)s'),
-        ])
-    else:
-        cmd.extend([
-            '-f', 'best[ext=mp4]',
-            '--output', os.path.join(DOWNLOAD_DIR, f'{video_id}.%(ext)s'),
-        ])
-    
-    cmd.append(youtube_url)
-    
+def get_stream_url(video_id, media_type):
+    """Get direct stream URL from YouTube"""
     try:
-        # Set environment to disable SSL
-        env = os.environ.copy()
-        env['PYTHONHTTPSVERIFY'] = '0'
-        env['GIT_SSL_NO_VERIFY'] = '1'
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+        # Get stream URL using yt-dlp
+        cmd = [
+            'yt-dlp',
+            '--no-check-certificates',
+            '--force-ipv4',
+            '--geo-bypass',
+            '--get-url',
+            '--format', 'bestaudio/best' if media_type == 'audio' else 'best[ext=mp4]',
+            '--quiet',
+            '--no-warnings',
+            youtube_url
+        ]
+        
+        logger.info(f"Getting stream URL for {video_id} ({media_type})")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode == 0:
-            if os.path.exists(output_path):
-                return True, output_path
-            
-            # Find any matching file
-            for filename in os.listdir(DOWNLOAD_DIR):
-                if filename.startswith(video_id):
-                    found_path = os.path.join(DOWNLOAD_DIR, filename)
-                    if filename != output_file:
-                        shutil.move(found_path, output_path)
-                    return True, output_path
+            stream_url = result.stdout.strip()
+            if stream_url and stream_url.startswith('http'):
+                logger.info(f"Got stream URL: {stream_url[:100]}...")
+                return True, stream_url
         
-        return False, result.stderr[:500] if result.stderr else "Download failed"
+        return False, result.stderr or "Failed to get stream URL"
         
     except Exception as e:
         return False, str(e)
 
-def try_download_no_ssl(video_id, media_type, youtube_url):
-    """Method 2: Complete SSL bypass"""
-    output_file = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
-    output_path = os.path.join(DOWNLOAD_DIR, output_file)
-    
-    # Create Python script that downloads without SSL
-    script_content = f'''
-import yt_dlp
-import os
-import ssl
-
-# Disable SSL verification
-ssl._create_default_https_context = ssl._create_unverified_context
-
-ydl_opts = {{
-    'quiet': True,
-    'no_warnings': True,
-    'no_check_certificate': True,
-    'force_ipv4': True,
-    'geo_bypass': True,
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-'''
-
-    if media_type == 'audio':
-        script_content += f'''
-    'format': 'bestaudio/best',
-    'postprocessors': [{{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }}],
-    'outtmpl': '{output_path.replace(".mp3", ".%(ext)s")}',
-'''
-    else:
-        script_content += f'''
-    'format': 'best[ext=mp4]',
-    'outtmpl': '{output_path.replace(".mp4", ".%(ext)s")}',
-'''
-
-    script_content += f'''
-}}
-
-try:
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download(['{youtube_url}'])
-    print("SUCCESS")
-except Exception as e:
-    print(f"ERROR: {{str(e)}}")
-'''
-    
-    # Write and execute script
-    script_path = os.path.join(DOWNLOAD_DIR, f'download_{video_id}.py')
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    
+def stream_youtube_data(video_id, media_type):
+    """Stream YouTube data directly to client"""
     try:
-        cmd = ['python3', script_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # Get stream URL
+        success, stream_url = get_stream_url(video_id, media_type)
         
-        # Clean up script
-        if os.path.exists(script_path):
-            os.remove(script_path)
+        if not success:
+            yield json.dumps({'error': stream_url}).encode()
+            return
         
-        if "SUCCESS" in result.stdout and os.path.exists(output_path):
-            return True, output_path
+        # Use ffmpeg to stream directly
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-i', stream_url,
+            '-c', 'copy',
+            '-f', 'mp3' if media_type == 'audio' else 'mp4',
+            'pipe:1'
+        ]
         
-        return False, result.stderr or result.stdout
+        # Start ffmpeg process
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10**8
+        )
         
+        # Stream data in chunks
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        try:
+            while True:
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+                
+                # Check if process is still alive
+                if process.poll() is not None:
+                    break
+                    
+        finally:
+            # Cleanup
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except:
+                process.kill()
+                
     except Exception as e:
-        return False, str(e)
+        logger.error(f"Stream error: {str(e)}")
+        yield json.dumps({'error': str(e)}).encode()
 
-def try_download_alternative(video_id, media_type, youtube_url):
-    """Method 3: Use alternative tool"""
-    output_file = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
-    output_path = os.path.join(DOWNLOAD_DIR, output_file)
+# ============== STREAM ENDPOINTS ==============
+
+@app.route('/stream', methods=['GET'])
+def stream_direct():
+    """
+    Stream YouTube video/audio directly without saving
     
-    try:
-        # Try using youtube-dl (older but sometimes works)
-        cmd = ['youtube-dl', '--no-check-certificate', '-f', 'best']
-        
-        if media_type == 'audio':
-            cmd.extend(['-x', '--audio-format', 'mp3'])
-        
-        cmd.extend(['-o', output_path.replace('.mp3', '.%(ext)s').replace('.mp4', '.%(ext)s'), youtube_url])
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode == 0 and os.path.exists(output_path):
-            return True, output_path
-        
-        return False, "All download methods failed"
-        
-    except Exception as e:
-        return False, str(e)
-
-# Install youtube-dl if not present
-def ensure_dependencies():
-    """Ensure all dependencies are installed"""
-    try:
-        # Install youtube-dl as backup
-        subprocess.run(['pip', 'install', 'youtube-dl'], capture_output=True)
-        logger.info("Dependencies checked")
-    except:
-        pass
-
-# ============== API ENDPOINTS ==============
-
-@app.route('/download', methods=['GET'])
-def download():
-    """Download endpoint with SSL fix"""
+    Parameters:
+        url: YouTube URL or Video ID
+        type: "audio" or "video"
+    
+    Returns:
+        Direct stream of the media
+    """
     try:
         video_url = request.args.get('url', '').strip()
         media_type = request.args.get('type', 'audio').strip().lower()
@@ -275,13 +162,224 @@ def download():
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
         
-        logger.info(f"Download request: {video_id} ({media_type})")
+        logger.info(f"Direct stream request: {video_id} ({media_type})")
         
-        success, result = download_media_fixed(video_id, media_type)
+        # Set appropriate headers
+        headers = {
+            'Content-Type': 'audio/mpeg' if media_type == 'audio' else 'video/mp4',
+            'Transfer-Encoding': 'chunked',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Accept-Ranges': 'bytes'
+        }
         
-        if success:
-            stream_url = f"{request.host_url.rstrip('/')}/stream/{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
+        # Add Content-Disposition for download
+        if request.args.get('download'):
+            filename = f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}"
+            headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        
+        # Stream the response
+        return Response(
+            stream_with_context(stream_youtube_data(video_id, media_type)),
+            headers=headers,
+            direct_passthrough=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Stream endpoint error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stream/audio', methods=['GET'])
+def stream_audio():
+    """Stream audio only"""
+    video_url = request.args.get('url', '').strip()
+    if not video_url:
+        return jsonify({'error': 'Missing URL'}), 400
+    
+    return stream_direct()
+
+@app.route('/stream/video', methods=['GET'])
+def stream_video():
+    """Stream video only"""
+    video_url = request.args.get('url', '').strip()
+    if not video_url:
+        return jsonify({'error': 'Missing URL'}), 400
+    
+    return stream_direct()
+
+@app.route('/stream/mp3', methods=['GET'])
+def stream_mp3():
+    """Stream as MP3"""
+    video_url = request.args.get('url', '').strip()
+    if not video_url:
+        return jsonify({'error': 'Missing URL'}), 400
+    
+    video_id = get_video_id(video_url)
+    if not video_id:
+        return jsonify({'error': 'Invalid URL'}), 400
+    
+    # Convert to MP3 while streaming
+    try:
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Get audio stream URL
+        cmd = [
+            'yt-dlp',
+            '--no-check-certificates',
+            '--get-url',
+            '--format', 'bestaudio',
+            '--quiet',
+            youtube_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            return jsonify({'error': 'Failed to get audio stream'}), 500
+        
+        stream_url = result.stdout.strip()
+        
+        # Stream with ffmpeg conversion to MP3
+        def generate():
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', stream_url,
+                '-c:a', 'libmp3lame',
+                '-q:a', '2',
+                '-f', 'mp3',
+                'pipe:1'
+            ]
             
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            try:
+                while True:
+                    chunk = process.stdout.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                process.terminate()
+        
+        headers = {
+            'Content-Type': 'audio/mpeg',
+            'Content-Disposition': f'attachment; filename="{video_id}.mp3"',
+            'Cache-Control': 'no-cache'
+        }
+        
+        return Response(
+            stream_with_context(generate()),
+            headers=headers
+        )
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stream/mp4', methods=['GET'])
+def stream_mp4():
+    """Stream as MP4"""
+    video_url = request.args.get('url', '').strip()
+    if not video_url:
+        return jsonify({'error': 'Missing URL'}), 400
+    
+    video_id = get_video_id(video_url)
+    if not video_id:
+        return jsonify({'error': 'Invalid URL'}), 400
+    
+    # Stream as MP4
+    try:
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Get video stream URL
+        cmd = [
+            'yt-dlp',
+            '--no-check-certificates',
+            '--get-url',
+            '--format', 'best[ext=mp4]',
+            '--quiet',
+            youtube_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            return jsonify({'error': 'Failed to get video stream'}), 500
+        
+        stream_url = result.stdout.strip()
+        
+        # Stream directly
+        def generate():
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', stream_url,
+                '-c', 'copy',
+                '-f', 'mp4',
+                'pipe:1'
+            ]
+            
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            try:
+                while True:
+                    chunk = process.stdout.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                process.terminate()
+        
+        headers = {
+            'Content-Type': 'video/mp4',
+            'Content-Disposition': f'attachment; filename="{video_id}.mp4"',
+            'Cache-Control': 'no-cache'
+        }
+        
+        return Response(
+            stream_with_context(generate()),
+            headers=headers
+        )
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============== COMPATIBILITY ENDPOINTS ==============
+
+@app.route('/download', methods=['GET'])
+def download_compat():
+    """
+    Compatibility endpoint - returns stream URL
+    (For clients expecting download endpoint)
+    """
+    try:
+        video_url = request.args.get('url', '').strip()
+        media_type = request.args.get('type', 'audio').strip().lower()
+        
+        if not video_url:
+            return jsonify({'error': 'Missing URL'}), 400
+        
+        if media_type not in ['audio', 'video']:
+            return jsonify({'error': 'Invalid type'}), 400
+        
+        video_id = get_video_id(video_url)
+        if not video_id:
+            return jsonify({'error': 'Invalid YouTube URL'}), 400
+        
+        # Return stream URL
+        stream_url = f"{request.host_url.rstrip('/')}/stream?url={video_id}&type={media_type}"
+        
+        # Check client for response format
+        user_agent = request.headers.get('User-Agent', '').lower()
+        
+        if 'python' in user_agent or 'requests' in user_agent:
             return jsonify({
                 'status': 'success',
                 'stream_url': stream_url,
@@ -289,130 +387,119 @@ def download():
                 'type': media_type
             })
         else:
-            return jsonify({'error': result}), 500
+            return jsonify({
+                'link': stream_url,
+                'stream_url': stream_url
+            })
             
     except Exception as e:
-        logger.error(f"Download error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/stream/<filename>', methods=['GET'])
-def stream_file(filename):
-    """Stream file"""
-    try:
-        if '..' in filename or '/' in filename:
-            return jsonify({'error': 'Invalid filename'}), 400
-        
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        file_size = os.path.getsize(filepath)
-        if file_size < 10000:
-            return jsonify({'error': 'File too small'}), 500
-        
-        if filename.endswith('.mp3'):
-            content_type = 'audio/mpeg'
-        elif filename.endswith('.mp4'):
-            content_type = 'video/mp4'
-        else:
-            content_type = 'application/octet-stream'
-        
-        response = send_file(filepath, mimetype=content_type, as_attachment=False)
-        response.headers['Accept-Ranges'] = 'bytes'
-        response.headers['Content-Length'] = str(file_size)
-        
-        return response
-        
-    except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ============== UTILITY ENDPOINTS ==============
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'service': 'YouTube Downloader (SSL Fixed)',
+        'service': 'YouTube Stream-Only API',
         'timestamp': datetime.now().isoformat(),
-        'ssl_fixed': True
+        'mode': 'stream-only',
+        'endpoints': {
+            'stream': '/stream?url=VIDEO_ID&type=audio|video',
+            'stream_audio': '/stream/audio?url=VIDEO_ID',
+            'stream_video': '/stream/video?url=VIDEO_ID',
+            'stream_mp3': '/stream/mp3?url=VIDEO_ID',
+            'stream_mp4': '/stream/mp4?url=VIDEO_ID',
+            'download_compat': '/download?url=VIDEO_ID&type=audio|video'
+        }
     })
 
-@app.route('/test/ssl', methods=['GET'])
-def test_ssl():
-    """Test SSL connection"""
+@app.route('/info/<video_id>', methods=['GET'])
+def video_info(video_id):
+    """Get video information"""
     try:
-        # Test YouTube access
-        import urllib.request
-        import ssl
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         
-        # Create unverified context
-        context = ssl._create_unverified_context()
+        cmd = [
+            'yt-dlp',
+            '--no-check-certificates',
+            '--dump-json',
+            '--quiet',
+            youtube_url
+        ]
         
-        req = urllib.request.Request(
-            'https://www.youtube.com',
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
-        response = urllib.request.urlopen(req, context=context, timeout=10)
-        return jsonify({
-            'status': 'success',
-            'message': 'SSL connection test passed',
-            'code': response.getcode()
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': 'SSL test failed',
-            'error': str(e)
-        }), 500
-
-@app.route('/fix/ssl', methods=['POST'])
-def fix_ssl():
-    """Force SSL fix"""
-    try:
-        # Update certificates
-        subprocess.run(['update-ca-certificates', '--fresh'], capture_output=True)
-        
-        # Clear Python certificate cache
-        import certifi
-        certifi.where()
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'SSL certificates updated'
-        })
-        
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            return jsonify({
+                'status': 'success',
+                'video_id': video_id,
+                'title': info.get('title'),
+                'duration': info.get('duration_string'),
+                'thumbnail': info.get('thumbnail'),
+                'formats': len(info.get('formats', [])),
+                'stream_urls': {
+                    'audio': f"{request.host_url.rstrip('/')}/stream/audio?url={video_id}",
+                    'video': f"{request.host_url.rstrip('/')}/stream/video?url={video_id}",
+                    'mp3': f"{request.host_url.rstrip('/')}/stream/mp3?url={video_id}",
+                    'mp4': f"{request.host_url.rstrip('/')}/stream/mp4?url={video_id}"
+                }
+            })
+        else:
+            return jsonify({'error': 'Failed to get video info'}), 500
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Cleanup
-def cleanup():
-    import threading
-    
-    def cleaner():
-        while True:
-            try:
-                current_time = time.time()
-                for filename in os.listdir(DOWNLOAD_DIR):
-                    filepath = os.path.join(DOWNLOAD_DIR, filename)
-                    if os.path.isfile(filepath):
-                        file_age = current_time - os.path.getmtime(filepath)
-                        if file_age > 86400:
-                            os.remove(filepath)
-                time.sleep(3600)
-            except:
-                time.sleep(300)
-    
-    thread = threading.Thread(target=cleaner, daemon=True)
-    thread.start()
+# ============== TEST ENDPOINTS ==============
 
-# Initialize
+@app.route('/test/stream', methods=['GET'])
+def test_stream():
+    """Test stream endpoint"""
+    video_id = request.args.get('id', 'YSWMbwQuWAY')
+    return f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Stream Test - {video_id}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 20px; }}
+            .player {{ max-width: 800px; margin: 0 auto; }}
+            audio, video {{ width: 100%; }}
+            .links {{ margin-top: 20px; }}
+            .link {{ margin: 10px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="player">
+            <h2>Stream Test: {video_id}</h2>
+            
+            <div class="links">
+                <div class="link">
+                    <h3>Audio Stream</h3>
+                    <audio controls>
+                        <source src="/stream?url={video_id}&type=audio" type="audio/mpeg">
+                    </audio>
+                    <p><a href="/stream?url={video_id}&type=audio" target="_blank">Direct Link</a></p>
+                </div>
+                
+                <div class="link">
+                    <h3>Video Stream</h3>
+                    <video controls width="100%">
+                        <source src="/stream?url={video_id}&type=video" type="video/mp4">
+                    </video>
+                    <p><a href="/stream?url={video_id}&type=video" target="_blank">Direct Link</a></p>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
 if __name__ == '__main__':
-    ensure_dependencies()
-    cleanup()
-    
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🔓 SSL-Fixed YouTube Downloader starting on port {port}")
-    logger.info("SSL verification is DISABLED for Heroku compatibility")
+    logger.info(f"🎵 Stream-Only YouTube API starting on port {port}")
+    logger.info("📡 Streaming directly from YouTube (no files saved)")
     app.run(host='0.0.0.0', port=port, debug=False)
