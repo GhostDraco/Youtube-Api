@@ -1,6 +1,5 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file
 import yt_dlp
-import uuid
 import os
 
 app = Flask(__name__)
@@ -8,52 +7,56 @@ app = Flask(__name__)
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-def download_audio(url):
-    file_id = str(uuid.uuid4())
-    output_path = f"{DOWNLOAD_FOLDER}/{file_id}.mp3"
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_path
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return file_id
+def download_media(video_id, type_):
+    file_ext = "mp3" if type_ == "audio" else "mp4"
+    file_path = f"{DOWNLOAD_FOLDER}/{video_id}.{file_ext}"
 
-def download_video(url):
-    file_id = str(uuid.uuid4())
-    output_path = f"{DOWNLOAD_FOLDER}/{file_id}.mp4"
+    if os.path.exists(file_path):  # cached file
+        return file_path
+
     ydl_opts = {
-        "format": "best",
-        "outtmpl": output_path
+        "format": "bestaudio/best" if type_ == "audio" else "best",
+        "outtmpl": file_path,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }] if type_ == "audio" else []
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return file_id
+        ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+    return file_path
 
 @app.route("/")
 def home():
-    return "Your YouTube Downloader API is Running 🔥"
+    return jsonify({"status": "Your API is running!"})
 
-@app.route("/audio")
-def audio_api():
-    url = request.args.get("url")
-    if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
-    file_id = download_audio(url)
-    return jsonify({"link": f"https://{HEROKU_APP_NAME}.herokuapp.com/stream/{file_id}.mp3"})
+@app.route("/download")
+def download():
+    video_id = request.args.get("url")
+    type_ = request.args.get("type")
 
-@app.route("/video")
-def video_api():
-    url = request.args.get("url")
-    if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
-    file_id = download_video(url)
-    return jsonify({"link": f"https://{HEROKU_APP_NAME}.herokuapp.com/stream/{file_id}.mp4"})
+    if not video_id or not type_:
+        return jsonify({"error": "Missing url or type"}), 400
+
+    file_path = download_media(video_id, type_)
+
+    return jsonify({
+        "status": "success",
+        "video_id": video_id,
+        "type": type_,
+        "downloaded": True,
+        "stream_url": f"{request.host_url}stream/{video_id}.{ 'mp3' if type_=='audio' else 'mp4'}"
+    })
 
 @app.route("/stream/<path:filename>")
-def stream_file(filename):
-    return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=False)
+def stream(filename):
+    file_path = f"{DOWNLOAD_FOLDER}/{filename}"
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(file_path, as_attachment=False)
 
-# Required for Heroku to detect server
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(debug=True)
